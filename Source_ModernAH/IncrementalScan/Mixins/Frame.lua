@@ -79,9 +79,9 @@ function AuctionatorIncrementalScanFrameMixin:WaitForData(attempt, lastCount, st
       end
       self:WaitForData(attempt + 1, 0, 0)
     elseif totalItems == 0 then
-      -- Give up
+      -- Give up — server cooldown (typically 15 min)
       self.scanState = "idle"
-      Auctionator.Utilities.Message("No auction data available.")
+      Auctionator.Utilities.Message("Scan on cooldown. Try again in ~15 minutes.")
     elseif totalItems == lastCount then
       -- Count is stable
       if stableCount >= 2 then
