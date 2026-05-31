@@ -51,15 +51,54 @@ function AuctionatorIncrementalScanFrameMixin:InitiateScan()
     return
   end
 
-  -- Call ReplicateItems to refresh the data
+  Auctionator.Debug.Message("Firestorm BG: InitiateScan called")
+  self.scanState = "waiting" -- prevent double-calls while waiting for data
+
+  -- Call ReplicateItems to request data from server
   C_AuctionHouse.ReplicateItems()
 
-  local totalItems = C_AuctionHouse.GetNumReplicateItems()
-  if totalItems == 0 then
-    Auctionator.Utilities.Message("No auction data available. Try again in a moment.")
-    return
-  end
+  Auctionator.Utilities.Message("Requesting auction data...")
 
+  -- Wait for data to fully load (server needs time to populate)
+  self:WaitForData(0, 0, 0)
+end
+
+function AuctionatorIncrementalScanFrameMixin:WaitForData(attempt, lastCount, stableCount)
+  C_Timer.After(1, function()
+    if self.scanState ~= "waiting" then return end
+
+    local totalItems = C_AuctionHouse.GetNumReplicateItems()
+    Auctionator.Debug.Message("Firestorm BG: wait " .. attempt .. " = " .. tostring(totalItems) .. " items (last=" .. lastCount .. ", stable=" .. stableCount .. ")")
+
+    if totalItems == 0 and attempt < 10 then
+      -- Still no data, keep waiting
+      if attempt == 3 then
+        -- Try calling ReplicateItems again
+        C_AuctionHouse.ReplicateItems()
+        Auctionator.Debug.Message("Firestorm BG: re-calling ReplicateItems")
+      end
+      self:WaitForData(attempt + 1, 0, 0)
+    elseif totalItems == 0 then
+      -- Give up
+      self.scanState = "idle"
+      Auctionator.Utilities.Message("No auction data available.")
+    elseif totalItems == lastCount then
+      -- Count is stable
+      if stableCount >= 2 then
+        -- Stable for 3 consecutive checks — data is fully loaded
+        self:StartProcessing(totalItems)
+      else
+        self:WaitForData(attempt + 1, totalItems, stableCount + 1)
+      end
+    else
+      -- Count is still growing, wait more
+      self:WaitForData(attempt + 1, totalItems, 0)
+    end
+  end)
+end
+
+function AuctionatorIncrementalScanFrameMixin:StartProcessing(totalItems)
+  Auctionator.Debug.Message("Firestorm BG: StartProcessing with " .. totalItems .. " items")
   Auctionator.Utilities.Message(AUCTIONATOR_L_STARTING_FULL_SCAN_SUMMARY ..
     " (" .. totalItems .. " auctions)")
   self.state.TimeOfLastBrowseScan = time()
