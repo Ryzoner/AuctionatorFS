@@ -17,8 +17,8 @@ function AuctionatorFullScanFrameMixin:ResetData()
 end
 
 function AuctionatorFullScanFrameMixin:InitiateScan()
-  -- Firestorm patch: ReplicateItems() does not work, fallback to IncrementalScan
-  Auctionator.Utilities.Message("Replicate scan not supported, using browse scan instead.")
+  -- Firestorm: ReplicateItems works, redirect to IncrementalScan which uses it
+  -- in background mode (doesn't affect UI)
   if Auctionator.State.IncrementalScanFrameRef then
     Auctionator.State.IncrementalScanFrameRef:InitiateScan()
   end
