@@ -1,14 +1,11 @@
 AuctionatorKeywordSearchProviderMixin = CreateFromMixins(AuctionatorMultiSearchMixin, AuctionatorSearchProviderMixin)
 
 -- Firestorm patch: C_AuctionHouse.SendBrowseQuery() doesn't work and
--- SearchButton:Click() switches tabs. Use local ReplicateItems search instead.
-
-local BATCH_SIZE = 500
-local BATCH_DELAY = 0.01
+-- SearchButton:Click() switches tabs. Use cached ReplicateItems data instead.
 
 function AuctionatorKeywordSearchProviderMixin:CreateSearchTerm(term)
   Auctionator.Debug.Message("AuctionatorKeywordSearchProviderMixin:CreateSearchTerm()", term)
-  return term  -- just the search string
+  return term
 end
 
 function AuctionatorKeywordSearchProviderMixin:GetSearchProvider()
@@ -21,38 +18,96 @@ function AuctionatorKeywordSearchProviderMixin:GetSearchProvider()
 end
 
 function AuctionatorKeywordSearchProviderMixin:FirestormLocalSearch(searchString)
+  -- Try cached data first
+  local cache = Auctionator.State.ReplicateCache
+  if cache and #cache > 0 then
+    Auctionator.Debug.Message("Firestorm Keyword: using cache (" .. #cache .. " items)")
+    self:SearchData(cache, searchString, true)
+    return
+  end
+
+  -- Fall back to live ReplicateItems
   local totalItems = C_AuctionHouse.GetNumReplicateItems()
-  Auctionator.Debug.Message("Firestorm Keyword: local search, replicate items = " .. totalItems)
+  Auctionator.Debug.Message("Firestorm Keyword: no cache, replicate items = " .. totalItems)
 
   if totalItems == 0 then
     C_AuctionHouse.ReplicateItems()
     C_Timer.After(3, function()
       local count = C_AuctionHouse.GetNumReplicateItems()
       if count > 0 then
-        self:ScanReplicateData(count, searchString)
+        self:SearchLive(count, searchString)
       else
         self.searchComplete = true
         self:AddResults({})
       end
     end)
   else
-    self:ScanReplicateData(totalItems, searchString)
+    self:SearchLive(totalItems, searchString)
   end
 end
 
-function AuctionatorKeywordSearchProviderMixin:ScanReplicateData(totalItems, searchString)
+function AuctionatorKeywordSearchProviderMixin:SearchData(cache, searchString, isCache)
   local searchLower = string.lower(searchString or "")
-  self.browseResultsMap = {}
-  self.replicateTotal = totalItems
+  local browseResultsMap = {}
 
-  self:ScanBatch(0, searchLower)
+  for _, item in ipairs(cache) do
+    if item.name and item.itemID and item.buyoutPrice > 0 then
+      local nameLower = string.lower(item.name)
+      local matches = (searchLower == "") or string.find(nameLower, searchLower, 1, true)
+
+      if matches then
+        local count = item.count or 1
+        local effectivePrice = math.floor(item.buyoutPrice / count)
+        local itemLevel = 0
+        if item.itemLink then
+          itemLevel = C_Item.GetDetailedItemLevelInfo(item.itemLink) or 0
+        end
+
+        local itemKey = {
+          itemID = item.itemID,
+          itemLevel = itemLevel,
+          itemSuffix = 0,
+          battlePetSpeciesID = 0,
+        }
+        local keyString = tostring(item.itemID) .. ":" .. tostring(itemLevel)
+
+        if not browseResultsMap[keyString] then
+          browseResultsMap[keyString] = {
+            itemKey = itemKey,
+            minPrice = effectivePrice,
+            totalQuantity = count,
+            containsOwnerItem = (item.owner == UnitName("player")),
+            name = item.name,
+          }
+        else
+          local existing = browseResultsMap[keyString]
+          existing.totalQuantity = existing.totalQuantity + count
+          if effectivePrice < existing.minPrice then
+            existing.minPrice = effectivePrice
+          end
+          if item.owner == UnitName("player") then
+            existing.containsOwnerItem = true
+          end
+        end
+      end
+    end
+  end
+
+  local results = {}
+  for _, result in pairs(browseResultsMap) do
+    table.insert(results, result)
+  end
+
+  Auctionator.Debug.Message("Firestorm Keyword: " .. #results .. " results")
+  self.searchComplete = true
+  self:AddResults(results)
 end
 
-function AuctionatorKeywordSearchProviderMixin:ScanBatch(startIndex, searchLower)
-  local limit = self.replicateTotal
-  local endIndex = math.min(startIndex + BATCH_SIZE, limit)
+function AuctionatorKeywordSearchProviderMixin:SearchLive(totalItems, searchString)
+  local searchLower = string.lower(searchString or "")
+  local browseResultsMap = {}
 
-  for i = startIndex, endIndex - 1 do
+  for i = 0, totalItems - 1 do
     local info = { C_AuctionHouse.GetReplicateItemInfo(i) }
     local name = info[1]
     local count = info[3] or 1
@@ -80,8 +135,8 @@ function AuctionatorKeywordSearchProviderMixin:ScanBatch(startIndex, searchLower
         }
         local keyString = tostring(itemID) .. ":" .. tostring(itemLevel)
 
-        if not self.browseResultsMap[keyString] then
-          self.browseResultsMap[keyString] = {
+        if not browseResultsMap[keyString] then
+          browseResultsMap[keyString] = {
             itemKey = itemKey,
             minPrice = effectivePrice,
             totalQuantity = count,
@@ -89,7 +144,7 @@ function AuctionatorKeywordSearchProviderMixin:ScanBatch(startIndex, searchLower
             name = name,
           }
         else
-          local existing = self.browseResultsMap[keyString]
+          local existing = browseResultsMap[keyString]
           existing.totalQuantity = existing.totalQuantity + count
           if effectivePrice < existing.minPrice then
             existing.minPrice = effectivePrice
@@ -102,24 +157,12 @@ function AuctionatorKeywordSearchProviderMixin:ScanBatch(startIndex, searchLower
     end
   end
 
-  if endIndex >= limit then
-    self:ProcessLocalResults()
-  else
-    C_Timer.After(BATCH_DELAY, function()
-      self:ScanBatch(endIndex, searchLower)
-    end)
-  end
-end
-
-function AuctionatorKeywordSearchProviderMixin:ProcessLocalResults()
   local results = {}
-  for _, result in pairs(self.browseResultsMap) do
+  for _, result in pairs(browseResultsMap) do
     table.insert(results, result)
   end
-  self.browseResultsMap = nil
 
-  Auctionator.Debug.Message("Firestorm Keyword: " .. #results .. " results")
-
+  Auctionator.Debug.Message("Firestorm Keyword: " .. #results .. " results (live)")
   self.searchComplete = true
   self:AddResults(results)
 end
@@ -130,13 +173,10 @@ function AuctionatorKeywordSearchProviderMixin:HasCompleteTermResults()
 end
 
 function AuctionatorKeywordSearchProviderMixin:OnSearchEventReceived(eventName, ...)
-  -- No-op, we use local search
 end
 
 function AuctionatorKeywordSearchProviderMixin:RegisterProviderEvents()
-  -- No events needed
 end
 
 function AuctionatorKeywordSearchProviderMixin:UnregisterProviderEvents()
-  -- No events to unregister
 end

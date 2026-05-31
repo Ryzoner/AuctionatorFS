@@ -2,10 +2,8 @@ AuctionatorDirectSearchProviderMixin = CreateFromMixins(AuctionatorMultiSearchMi
 
 -- Firestorm patch: C_AuctionHouse.SendBrowseQuery() doesn't work and
 -- SearchButton:Click() switches tabs away from Shopping.
--- Instead we search locally through ReplicateItems data.
-
-local BATCH_SIZE = 500
-local BATCH_DELAY = 0.01
+-- Instead we search locally through cached ReplicateItems data (from Full Scan)
+-- or fall back to live ReplicateItems API if cache is available.
 
 local QUALITY_TO_FILTER = {
   [0] = Enum.AuctionHouseFilter.PoorQuality,
@@ -82,38 +80,43 @@ function AuctionatorDirectSearchProviderMixin:GetSearchProvider()
 end
 
 function AuctionatorDirectSearchProviderMixin:FirestormLocalSearch()
+  -- Try cached data first (from Full Scan)
+  local cache = Auctionator.State.ReplicateCache
+  if cache and #cache > 0 then
+    Auctionator.Debug.Message("Firestorm Shopping: using cache (" .. #cache .. " items)")
+    self:SearchCache(cache)
+    return
+  end
+
+  -- Fall back to live ReplicateItems
   local totalItems = C_AuctionHouse.GetNumReplicateItems()
-  Auctionator.Debug.Message("Firestorm Shopping: local search, replicate items = " .. totalItems)
+  Auctionator.Debug.Message("Firestorm Shopping: no cache, replicate items = " .. totalItems)
 
   if totalItems == 0 then
-    -- No replicate data available, try to request it
     C_AuctionHouse.ReplicateItems()
-    -- Wait and retry
     C_Timer.After(3, function()
       local count = C_AuctionHouse.GetNumReplicateItems()
-      Auctionator.Debug.Message("Firestorm Shopping: after wait, replicate items = " .. count)
       if count > 0 then
-        self:ScanReplicateData(count)
+        self:SearchLiveReplicate(count)
       else
-        -- No data available, return empty
-        Auctionator.Debug.Message("Firestorm Shopping: no replicate data, returning empty")
+        Auctionator.Debug.Message("Firestorm Shopping: no data available")
         self.searchComplete = true
         self:AddResults({})
       end
     end)
   else
-    self:ScanReplicateData(totalItems)
+    self:SearchLiveReplicate(totalItems)
   end
 end
 
-function AuctionatorDirectSearchProviderMixin:ScanReplicateData(totalItems)
+-- Fast path: search through pre-built cache (instant)
+function AuctionatorDirectSearchProviderMixin:SearchCache(cache)
   local searchString = self.currentQuery.searchString or ""
   local searchLower = string.lower(searchString)
   local filters = self.currentQuery.filters or {}
   local minLevel = self.currentQuery.minLevel
   local maxLevel = self.currentQuery.maxLevel
 
-  -- Determine required quality from filters
   local requiredQuality = nil
   for _, filter in ipairs(filters) do
     if FILTER_TO_QUALITY[filter] ~= nil then
@@ -122,27 +125,91 @@ function AuctionatorDirectSearchProviderMixin:ScanReplicateData(totalItems)
     end
   end
 
-  self.browseResultsMap = {}  -- itemKey string -> aggregated browse result
-  self.replicateTotal = totalItems
-  self.replicateProcessed = 0
+  local browseResultsMap = {}
 
-  Auctionator.Debug.Message("Firestorm Shopping: scanning " .. totalItems .. " items for '" .. searchString .. "'")
+  for _, item in ipairs(cache) do
+    if item.name and item.itemID and item.buyoutPrice > 0 then
+      local nameLower = string.lower(item.name)
+      local matches = (searchLower == "") or string.find(nameLower, searchLower, 1, true)
 
-  self:ScanBatch(0, searchLower, requiredQuality, minLevel, maxLevel)
+      if matches and requiredQuality ~= nil then
+        matches = (item.qualityID == requiredQuality)
+      end
+      if matches and minLevel and minLevel > 0 then
+        matches = (item.level >= minLevel)
+      end
+      if matches and maxLevel and maxLevel > 0 then
+        matches = (item.level <= maxLevel)
+      end
+
+      if matches then
+        local count = item.count or 1
+        local effectivePrice = math.floor(item.buyoutPrice / count)
+        local itemLevel = 0
+        if item.itemLink then
+          itemLevel = C_Item.GetDetailedItemLevelInfo(item.itemLink) or 0
+        end
+
+        local itemKey = {
+          itemID = item.itemID,
+          itemLevel = itemLevel,
+          itemSuffix = 0,
+          battlePetSpeciesID = 0,
+        }
+        local keyString = tostring(item.itemID) .. ":" .. tostring(itemLevel)
+
+        if not browseResultsMap[keyString] then
+          browseResultsMap[keyString] = {
+            itemKey = itemKey,
+            minPrice = effectivePrice,
+            totalQuantity = count,
+            containsOwnerItem = (item.owner == UnitName("player")),
+            name = item.name,
+          }
+        else
+          local existing = browseResultsMap[keyString]
+          existing.totalQuantity = existing.totalQuantity + count
+          if effectivePrice < existing.minPrice then
+            existing.minPrice = effectivePrice
+          end
+          if item.owner == UnitName("player") then
+            existing.containsOwnerItem = true
+          end
+        end
+      end
+    end
+  end
+
+  -- Convert to array and process through filters
+  local results = {}
+  for _, result in pairs(browseResultsMap) do
+    table.insert(results, result)
+  end
+
+  Auctionator.Debug.Message("Firestorm Shopping: " .. #results .. " unique items matched")
+  self:ProcessFilteredResults(results)
 end
 
-function AuctionatorDirectSearchProviderMixin:ScanBatch(startIndex, searchLower, requiredQuality, minLevel, maxLevel)
-  local limit = self.replicateTotal
-  local endIndex = math.min(startIndex + BATCH_SIZE, limit)
+-- Slow path: scan live ReplicateItems data
+function AuctionatorDirectSearchProviderMixin:SearchLiveReplicate(totalItems)
+  local searchString = self.currentQuery.searchString or ""
+  local searchLower = string.lower(searchString)
+  local filters = self.currentQuery.filters or {}
+  local minLevel = self.currentQuery.minLevel
+  local maxLevel = self.currentQuery.maxLevel
 
-  for i = startIndex, endIndex - 1 do
+  local requiredQuality = nil
+  for _, filter in ipairs(filters) do
+    if FILTER_TO_QUALITY[filter] ~= nil then
+      requiredQuality = FILTER_TO_QUALITY[filter]
+      break
+    end
+  end
+
+  local browseResultsMap = {}
+
+  for i = 0, totalItems - 1 do
     local info = { C_AuctionHouse.GetReplicateItemInfo(i) }
-    -- info fields:
-    -- [1]=name, [2]=texture, [3]=count, [4]=qualityID, [5]=usable,
-    -- [6]=level, [7]=levelType, [8]=minBid, [9]=minIncrement,
-    -- [10]=buyoutPrice, [11]=bidAmount, [12]=highBidder, [13]=bidderFullName,
-    -- [14]=owner, [15]=ownerFullName, [16]=saleStatus, [17]=itemID, [18]=hasAllInfo
-
     local name = info[1]
     local count = info[3] or 1
     local qualityID = info[4]
@@ -153,16 +220,11 @@ function AuctionatorDirectSearchProviderMixin:ScanBatch(startIndex, searchLower,
 
     if name and itemID and buyoutPrice > 0 then
       local nameLower = string.lower(name)
-
-      -- Match search string
       local matches = (searchLower == "") or string.find(nameLower, searchLower, 1, true)
 
-      -- Match quality filter
       if matches and requiredQuality ~= nil then
         matches = (qualityID == requiredQuality)
       end
-
-      -- Match level filter
       if matches and minLevel and minLevel > 0 then
         matches = (level >= minLevel)
       end
@@ -178,7 +240,6 @@ function AuctionatorDirectSearchProviderMixin:ScanBatch(startIndex, searchLower,
           itemLevel = C_Item.GetDetailedItemLevelInfo(link) or 0
         end
 
-        -- Build itemKey
         local itemKey = {
           itemID = itemID,
           itemLevel = itemLevel,
@@ -187,9 +248,8 @@ function AuctionatorDirectSearchProviderMixin:ScanBatch(startIndex, searchLower,
         }
         local keyString = tostring(itemID) .. ":" .. tostring(itemLevel)
 
-        -- Aggregate into browse-like results
-        if not self.browseResultsMap[keyString] then
-          self.browseResultsMap[keyString] = {
+        if not browseResultsMap[keyString] then
+          browseResultsMap[keyString] = {
             itemKey = itemKey,
             minPrice = effectivePrice,
             totalQuantity = count,
@@ -197,7 +257,7 @@ function AuctionatorDirectSearchProviderMixin:ScanBatch(startIndex, searchLower,
             name = name,
           }
         else
-          local existing = self.browseResultsMap[keyString]
+          local existing = browseResultsMap[keyString]
           existing.totalQuantity = existing.totalQuantity + count
           if effectivePrice < existing.minPrice then
             existing.minPrice = effectivePrice
@@ -210,28 +270,16 @@ function AuctionatorDirectSearchProviderMixin:ScanBatch(startIndex, searchLower,
     end
   end
 
-  self.replicateProcessed = endIndex
-
-  if endIndex >= limit then
-    -- Done scanning, process results through filters
-    self:ProcessLocalResults()
-  else
-    C_Timer.After(BATCH_DELAY, function()
-      self:ScanBatch(endIndex, searchLower, requiredQuality, minLevel, maxLevel)
-    end)
-  end
-end
-
-function AuctionatorDirectSearchProviderMixin:ProcessLocalResults()
-  -- Convert map to array
   local results = {}
-  for _, result in pairs(self.browseResultsMap) do
+  for _, result in pairs(browseResultsMap) do
     table.insert(results, result)
   end
-  self.browseResultsMap = nil
 
-  Auctionator.Debug.Message("Firestorm Shopping: " .. #results .. " unique items matched")
+  Auctionator.Debug.Message("Firestorm Shopping: " .. #results .. " unique items matched (live)")
+  self:ProcessFilteredResults(results)
+end
 
+function AuctionatorDirectSearchProviderMixin:ProcessFilteredResults(results)
   self.searchComplete = true
 
   -- Process results through the filter system
@@ -267,7 +315,6 @@ function AuctionatorDirectSearchProviderMixin:GetCurrentEmptyResult()
 end
 
 function AuctionatorDirectSearchProviderMixin:OnSearchEventReceived(eventName, ...)
-  -- Handle item info events for filters that need them
   if eventName == "EXTRA_BROWSE_INFO_RECEIVED" or eventName == "GET_ITEM_INFO_RECEIVED" then
     Auctionator.EventBus
       :RegisterSource(self, "AuctionatorDirectSearchProviderMixin")
@@ -288,12 +335,10 @@ function AuctionatorDirectSearchProviderMixin:ReceiveEvent(eventName, results)
 end
 
 function AuctionatorDirectSearchProviderMixin:RegisterProviderEvents()
-  -- Register for filter completion events
   if not self.registeredForEvents then
     self.registeredForEvents = true
     Auctionator.EventBus:Register(self, { Auctionator.Search.Events.SearchResultsReady })
   end
-  -- Register for item info loading (needed by some filters)
   self:RegisterEvents({
     "GET_ITEM_INFO_RECEIVED",
     "EXTRA_BROWSE_INFO_RECEIVED",

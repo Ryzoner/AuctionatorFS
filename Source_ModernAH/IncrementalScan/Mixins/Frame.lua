@@ -288,6 +288,25 @@ function AuctionatorIncrementalScanFrameMixin:EndProcessing()
   -- Process into database
   local dbCount = Auctionator.Database:ProcessScan(allInfo)
 
+  -- Cache replicate data for Shopping search
+  Auctionator.State.ReplicateCache = {}
+  for index = 1, #fixedScanData do
+    local info = fixedScanData[index].replicateInfo
+    if info[1] and info[17] then
+      table.insert(Auctionator.State.ReplicateCache, {
+        name = info[1],
+        count = info[3] or 1,
+        qualityID = info[4],
+        level = info[6] or 0,
+        buyoutPrice = info[10] or 0,
+        itemID = info[17],
+        owner = info[14],
+        itemLink = fixedScanData[index].itemLink,
+      })
+    end
+  end
+  Auctionator.Debug.Message("Firestorm BG: cached " .. #Auctionator.State.ReplicateCache .. " items for Shopping")
+
   self.scanState = "idle"
   self.scanData = {}
   self.dbKeysMapping = {}
