@@ -63,6 +63,20 @@ Auctionator — аддон для повседневного использов�
 
 Удалён `<OnEvent method="OnEvent"/>` — обработка событий теперь через `SetScript` в Lua, чтобы избежать конфликтов с polling-подходом.
 
+### 5. Поиск из списка покупок (Shopping) — локальный поиск по данным ReplicateItems
+**Файлы:** `Source_ModernAH/Search/Mixins/DirectSearchProviderMixin.lua`, `Source_ModernAH/Search/Mixins/KeywordSearchProviderMixin.lua`, `Source_ModernAH/IncrementalScan/Mixins/Frame.lua`
+
+`C_AuctionHouse.SendBrowseQuery()` на Firestorm не возвращает результатов, а обход через `SearchButton:Click()` выкидывает пользователя из вкладки Shopping в стандартный поиск — оба пути отброшены.
+
+Вместо этого поиск работает локально по данным аукциона, которые уже собирает скан:
+- Full Scan/IncrementalScan при завершении кэширует сырые данные `ReplicateItems` в `Auctionator.State.ReplicateCache` (имя, itemID, цена, количество, владелец, itemLink)
+- Поиск по терму фильтрует кэш на клиенте: по подстроке имени (без регистра), качеству, min/max уровню; цена считается за единицу (`buyoutPrice / count`)
+- Дубликаты одного предмета схлопываются в строку: `minPrice` = минимум, `totalQuantity` = сумма
+- Если кэша нет (скан не запускали) — фоллбэк на живой проход по `GetReplicateItemInfo()`, при пустых данных делается `ReplicateItems()` и повтор через 3 секунды
+- Результаты идут дальше по штатному конвейеру фильтров Auctionator (цена, ilvl, точный поиск, экспансия — всё клиентское)
+
+Важно: поиск отражает состояние аукциона на момент последнего скана. Перед поиском актуальных цен запускайте Full Scan.
+
 ---
 
 ## Результаты сканирования
@@ -87,7 +101,8 @@ Auctionator — аддон для повседневного использов�
 
 ## Известные ограничения
 
-- **Поиск предметов (Shopping/Buying)** — вкладки поиска отдельных предметов скорее всего не работают, т.к. `SendSearchQuery`/`SendBrowseQuery` с фильтрами сломаны на Firestorm
+- **Вкладка Buying (стандартный Browse Blizzard)** — поиск там скорее всего не работает, т.к. `SendSearchQuery`/`SendBrowseQuery` сломаны на Firestorm. Список покупок (Shopping) исправлен патчем №5
+- **Поиск Shopping зависит от скана** — без свежего Full Scan результаты могут отставать от реальных лотов
 - **Ошибка на вкладке Selling** — `TableKeys.lua:3: bad argument #1 to 'pairs'` может возникать при клике на предметы в сумке (не связано со сканированием)
 - **Событие REPLICATE_ITEM_LIST_UPDATE** — не приходит, но данные доступны сразу после вызова `ReplicateItems()`
 
